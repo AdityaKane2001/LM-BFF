@@ -4,9 +4,12 @@ import dataclasses
 import logging
 import os
 import sys
+import random
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
 import torch
+from torch import nn
+from sklearn.metrics import roc_auc_score
 
 import numpy as np
 
@@ -18,7 +21,7 @@ from transformers import HfArgumentParser, TrainingArguments, set_seed
 from src.dataset import FewShotDataset, FewShotOODValidationDataset
 from src.models import BertForPromptFinetuning,BertForPromptFinetuningWithOODDetection, RobertaForPromptFinetuning, resize_token_type_embeddings
 from src.trainer import Trainer
-from src.processors import processors_mapping, num_labels_mapping, output_modes_mapping, classification_processors, compute_metrics_mapping, bound_mapping
+from src.processors import MnliProcessor, processors_mapping, num_labels_mapping, output_modes_mapping, classification_processors, compute_metrics_mapping, bound_mapping
 
 from filelock import FileLock
 from datetime import datetime
@@ -242,6 +245,38 @@ def main():
         else None
     )
 
+    for i in train_dataset:
+        print(tokenizer.decode(i.input_ids))
+        break
+    return 
+    set_seed(training_args.seed)
+    
+    ood_dataset = []
+
+    ood_args = [
+        
+    ]
+
+    ood_data_args = DynamicDataTrainingArguments(task_name='mnli', data_dir='data/k-shot/MNLI/16-42', max_seq_length=256, overwrite_cache=False, num_k=16, num_sample=16, num_demo=1, auto_demo=True, template='*cls**sent-_0*?*mask*,*+sentl_1**sep+*', mapping="{'contradiction':'No','entailment':'Yes','neutral':'Maybe'}", template_path=None, mapping_path=None, prompt_path=None, template_id=None, mapping_id=None, prompt_id=None, top_n_template=None, tag='', demo_filter=False, demo_filter_rate=0.5, demo_filter_model=None, debug_mode=False, double_demo=False, first_sent_limit=None, other_sent_limit=None, use_full_length=False, gpt3_in_context_head=False, gpt3_in_context_tail=False, gpt3_in_context_num=32, truncate_head=False, prompt=True, template_list=None)
+    ood_dataset = FewShotOODValidationDataset(ood_data_args, tokenizer=tokenizer, mode="test", use_demo=("demo" in model_args.few_shot_type))
+    
+    id_list = list()
+    for i in test_dataset[:100]:
+        id_list.append([i, 0])
+    
+    ood_list = list()
+    for i in ood_dataset[:100]:
+        ood_list.append([i, 1])
+
+    combined = id_list + ood_list
+    random.shuffle(combined)
+    
+    iidlen = len(id_list)
+    oodlen = len(ood_list)
+
+    combined = list(zip(*combined))
+    inputs, labels = combined[0], combined[1]
+    # return None
     # for i in train_dataset:
     #     print("####### Train example")
     #     print(tokenizer.decode(i.input_ids))
@@ -251,15 +286,15 @@ def main():
     #     print("####### Eval example")
     #     print(tokenizer.decode(i.input_ids))
     #     break
+
+
+    # for i in test_dataset:
+    #     print("####### Test example")
+    #     print(i)
+    #     print(tokenizer.decode(i.input_ids) )
+    #     break
+
     
-    for i in test_dataset:
-        print("####### Test example")
-        print(i)
-        print(tokenizer.decode(i.input_ids) )
-        break
-
-    set_seed(training_args.seed)
-
 
     model = model_fn.from_pretrained(
         model_args.model_name_or_path,
@@ -284,6 +319,62 @@ def main():
     model.tokenizer = tokenizer
 
     # Build metric
+
+    activation = {}
+    def getActivation(name):
+        # the hook signature
+        def hook(model, input, output):
+            activation[name] = output.detach()
+        return hook
+
+    hook = model.g_act.register_forward_hook(getActivation("g_act"))
+
+    activations = list()
+    print(oodlen)
+    # return 
+    # print(test_dataset[:10])
+    for i in inputs:
+        model(
+            input_ids=torch.unsqueeze(torch.tensor(i.input_ids),0),
+            attention_mask=torch.unsqueeze(torch.tensor(i.attention_mask),0),
+            token_type_ids=None,
+            mask_pos=torch.unsqueeze(torch.tensor(i.mask_pos),0),
+            labels=torch.tensor([1])
+        )
+
+        activations.append(activation["g_act"])
+
+    all_acts = torch.cat(activations).numpy()
+    # all_acts = np.round(all_acts)
+
+    def accuracy(true, pred):
+        acc = np.sum((np.array(true) == np.reshape(np.round(pred),(-1,))).astype(np.float32))
+        return float(acc / len(true))
+    
+    def auroc(true, pred):
+        return roc_auc_score(true, pred)
+    
+    print(accuracy(labels , all_acts))
+    print(auroc(labels , all_acts))
+
+    # all_acts = np.sum((all_acts <= 0.5).astype(np.float32))
+    # print(iidlen)
+    
+    # print(all_acts)
+    
+    hook.remove()
+    return None
+    # Initialize our Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        compute_metrics=build_compute_metrics_fn(data_args.task_name)
+    )
+
+    
+
     def build_compute_metrics_fn(task_name: str) -> Callable[[EvalPrediction], Dict]:
         def compute_metrics_fn(p: EvalPrediction):
             # Note: the eval dataloader is sequential, so the examples are in order.
@@ -309,38 +400,6 @@ def main():
 
         return compute_metrics_fn
     
-    activation = {}
-    def getActivation(name):
-        # the hook signature
-        def hook(model, input, output):
-            activation[name] = output.detach()
-        return hook
-
-    hook = model.g_act.register_forward_hook(getActivation("g_act"))
-
-    print(model(
-        input_ids=torch.unsqueeze(torch.tensor(i.input_ids),0),
-        attention_mask=torch.unsqueeze(torch.tensor(i.attention_mask),0),
-        token_type_ids=None,
-        mask_pos=torch.unsqueeze(torch.tensor(i.mask_pos),0),
-        labels=torch.tensor([1])
-    ))
-
-    print(activation)
-    hook.remove()
-
-    # Initialize our Trainer
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        compute_metrics=build_compute_metrics_fn(data_args.task_name)
-    )
-
-
-
-    return None
 
     
     # Training

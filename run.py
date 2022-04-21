@@ -1,4 +1,3 @@
-"""Finetuning the library models for sequence classification on GLUE."""
 
 import dataclasses
 import logging
@@ -15,8 +14,8 @@ from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTok
 from transformers import GlueDataTrainingArguments as DataTrainingArguments
 from transformers import HfArgumentParser, TrainingArguments, set_seed
 
-from src.dataset import FewShotDataset, FewShotOODValidationDataset
-from src.models import BertForPromptFinetuning,BertForPromptFinetuningWithOODDetection, RobertaForPromptFinetuning, resize_token_type_embeddings
+from src.dataset import FewShotDataset
+from src.models import BertForPromptFinetuning, RobertaForPromptFinetuning, resize_token_type_embeddings
 from src.trainer import Trainer
 from src.processors import processors_mapping, num_labels_mapping, output_modes_mapping, compute_metrics_mapping, bound_mapping
 
@@ -436,7 +435,7 @@ def main():
         if config.model_type == 'roberta':
             model_fn = RobertaForPromptFinetuning
         elif config.model_type == 'bert':
-            model_fn = BertForPromptFinetuningWithOODDetection
+            model_fn = BertForPromptFinetuning
         else:
             raise NotImplementedError
     elif model_args.few_shot_type == 'finetune':
@@ -457,35 +456,17 @@ def main():
         FewShotDataset(data_args, tokenizer=tokenizer, mode="train", use_demo=("demo" in model_args.few_shot_type))
     )
     eval_dataset = (
-        FewShotOODValidationDataset(data_args, tokenizer=tokenizer, mode="dev", use_demo=("demo" in model_args.few_shot_type))
+        FewShotDataset(data_args, tokenizer=tokenizer, mode="dev", use_demo=("demo" in model_args.few_shot_type))
         if training_args.do_eval
         else None
     )
     test_dataset = (
-        FewShotOODValidationDataset(data_args, tokenizer=tokenizer, mode="test", use_demo=("demo" in model_args.few_shot_type))
+        FewShotDataset(data_args, tokenizer=tokenizer, mode="test", use_demo=("demo" in model_args.few_shot_type))
         if training_args.do_predict
         else None
     )
 
-    # for i in train_dataset:
-    #     print("####### Train example")
-    #     print(tokenizer.decode(i.input_ids))
-    #     break
-    
-    # for i in eval_dataset:
-    #     print("####### Eval example")
-    #     print(tokenizer.decode(i.input_ids))
-    #     break
-    
-    # for i in test_dataset:
-    #     print("####### Test example")
-    #     print(tokenizer.decode(i.input_ids) )
-    #     break
-
-    # return None
-
     set_seed(training_args.seed)
-
 
     model = model_fn.from_pretrained(
         model_args.model_name_or_path,

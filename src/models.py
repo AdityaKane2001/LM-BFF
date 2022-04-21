@@ -202,6 +202,12 @@ class BertForPromptFinetuningWithOODDetection(BertPreTrainedModel):
         super().__init__(config)
         self.num_labels = config.num_labels
         self.bert = BertModel(config)
+        
+        self.g = nn.Linear(768, 1)
+        self.g_bn = nn.BatchNorm1d(1)
+        self.g_act = nn.Sigmoid()
+
+        self.h = nn.Linear(768, 768)
         self.cls = BertOnlyMLMHead(config)
         self.init_weights()
 
@@ -224,10 +230,7 @@ class BertForPromptFinetuningWithOODDetection(BertPreTrainedModel):
         # g = Activation("sigmoid")(g)
         # outputs = tf.math.divide(h, g)
 
-        self.h = nn.Linear(768, 768)
-        self.g = nn.Linear(768, 1)
-        self.g_bn = nn.BatchNorm1d(1)
-        self.g_act = nn.Sigmoid()
+        
 
 
     def forward(
@@ -250,9 +253,6 @@ class BertForPromptFinetuningWithOODDetection(BertPreTrainedModel):
             token_type_ids=token_type_ids
         )
 
-
-        
-
         # Get <mask> token representation
         sequence_output, pooled_output = outputs[:2]
         sequence_mask_output = sequence_output[torch.arange(sequence_output.size(0)), mask_pos]
@@ -262,8 +262,6 @@ class BertForPromptFinetuningWithOODDetection(BertPreTrainedModel):
         g_seq = self.g(sequence_mask_output)
         g_seq = self.g_bn(g_seq)
         g_seq = self.g_act(g_seq)
-
-
 
         sequence_mask_output = torch.div(h_seq, g_seq)
 
