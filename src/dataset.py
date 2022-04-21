@@ -130,6 +130,8 @@ def tokenize_multipart_input(
                 new_tokens.append(label_word)
             elif part[:5] == 'sent_':
                 sent_id = int(part.split('_')[1])
+                # print(input_text_list)
+                # print(sent_id)
                 new_tokens += enc(input_text_list[sent_id]) 
             elif part[:6] == '+sent_':
                 # Add space
@@ -629,6 +631,7 @@ class FewShotDataset(torch.utils.data.Dataset):
                 for label_id in range(len(label_map)):
                     augmented_example += support_by_label[label_id]
 
+
             # Tokenization (based on the template)
             inputs = tokenize_multipart_input(
                 input_text_list=augmented_example,
@@ -655,4 +658,284 @@ class FewShotDataset(torch.utils.data.Dataset):
         return features
 
 
+class FewShotOODValidationDataset(FewShotDataset):
+    def __init__(self, args, tokenizer,  cache_dir=None, mode="train", use_demo=False):
+        self.args = args
+        self.task_name = args.task_name
+        self.processor = processors_mapping[args.task_name]
+        self.tokenizer = tokenizer
+        self.mode = mode
+        self.id_processor = processors_mapping[args.task_name]
+        ood_dataset = "rte"
+        self.ood_processor = processors_mapping[ood_dataset]
 
+        # args.prompt = False
+
+        # If not using demonstrations, use use_demo=True
+        self.use_demo = False
+        if self.use_demo:
+            logger.info("Use demonstrations")
+        assert mode in ["train", "dev", "test"]
+
+        # Get label list and (for prompt) label word list
+        self.label_list = self.processor.get_labels()
+        self.num_labels = len(self.label_list)
+        if args.prompt:
+            assert args.mapping is not None
+            self.label_to_word = eval(args.mapping)
+
+            for key in self.label_to_word:
+                # For RoBERTa/BART/T5, tokenization also considers space, so we use space+word as label words.
+                if self.label_to_word[key][0] not in ['<', '[', '.', ',']:
+                    # Make sure space+word is in the vocabulary
+                    assert len(tokenizer.tokenize(' ' + self.label_to_word[key])) == 1
+                    self.label_to_word[key] = tokenizer._convert_token_to_id(tokenizer.tokenize(' ' + self.label_to_word[key])[0])
+                else:
+                    self.label_to_word[key] = tokenizer._convert_token_to_id(self.label_to_word[key])
+                logger.info("Label {} to word {} ({})".format(key, tokenizer._convert_id_to_token(self.label_to_word[key]), self.label_to_word[key]))
+            
+            if len(self.label_list) > 1:
+                self.label_word_list = [self.label_to_word[label] for label in self.label_list]
+            else:
+                # Regression task
+                # '0' represents low polarity and '1' represents high polarity.
+                self.label_word_list = [self.label_to_word[label] for label in ['0', '1']]
+        else:
+            self.label_to_word = None
+            self.label_word_list = None
+
+        # Multiple sampling: when using demonstrations, we sample different combinations of demonstrations during 
+        # inference and aggregate the results by averaging the logits. The number of different samples is num_sample.
+        if (mode == "train") or not self.use_demo:
+            # We do not do multiple sampling when not using demonstrations or when it's the training mode 
+            self.num_sample = 1
+        else:
+            self.num_sample = args.num_sample
+
+        # If we use multiple templates, we also need to do multiple sampling during inference.
+        if args.prompt and args.template_list is not None:
+            logger.info("There are %d templates. Multiply num_sample by %d" % (len(args.template_list), len(args.template_list)))
+            self.num_sample *= len(args.template_list)
+                
+        logger.info("Total num_sample for mode %s: %d" % (mode, self.num_sample))
+
+        # Load cache
+        # Cache name distinguishes mode, task name, tokenizer, and length. So if you change anything beyond these elements, make sure to clear your cache.
+        cached_features_file = os.path.join(
+            cache_dir if cache_dir is not None else args.data_dir,
+            "cached_{}_{}_{}_{}".format(
+                mode,
+                tokenizer.__class__.__name__,
+                str(args.max_seq_length),
+                args.task_name,
+            ),
+        )
+
+        logger.info(f"Creating/loading examples from dataset file at {args.data_dir}")
+
+        lock_path = cached_features_file + ".lock"
+        with FileLock(lock_path):
+
+            if os.path.exists(cached_features_file) and not args.overwrite_cache:
+                start = time.time()
+                self.support_examples, self.query_examples = torch.load(cached_features_file)
+                logger.info(
+                    f"Loading features from cached file {cached_features_file} [took %.3f s]", time.time() - start
+                )
+            else:
+                logger.info(f"Creating features from dataset file at {args.data_dir}")
+
+                # The support examples are sourced from the training set.
+                self.support_examples = self.processor.get_train_examples(args.data_dir)
+
+                if mode == "dev":
+                    self.query_examples = self.processor.get_dev_examples(args.data_dir)
+                elif mode == "test":
+                    self.query_examples = self.processor.get_test_examples(args.data_dir)
+                else:
+                    self.query_examples = self.support_examples
+
+                start = time.time()
+                torch.save([self.support_examples, self.query_examples], cached_features_file)
+                # ^ This seems to take a lot of time so I want to investigate why and how we can improve.
+                logger.info(
+                    "Saving features into cached file %s [took %.3f s]", cached_features_file, time.time() - start
+                )
+
+        # For filtering in using demonstrations, load pre-calculated embeddings
+     
+ 
+        # Size is expanded by num_sample
+        self.size = len(self.query_examples) * self.num_sample
+        
+        # Prepare examples (especially for using demonstrations)
+        support_indices = list(range(len(self.support_examples)))
+        self.example_idx = []
+        for sample_idx in range(self.num_sample):
+            for query_idx in range(len(self.query_examples)):
+                # If training, exclude the current example. Else keep all.
+                if self.use_demo and args.demo_filter:
+                    # Demonstration filtering
+                    candidate = [support_idx for support_idx in support_indices
+                                   if support_idx != query_idx or mode != "train"]
+                    sim_score = []
+                    for support_idx in candidate:
+                        sim_score.append((support_idx, util.pytorch_cos_sim(self.support_emb[support_idx], self.query_emb[query_idx])))
+                    sim_score.sort(key=lambda x: x[1], reverse=True)
+                    if self.num_labels == 1:
+                        # Regression task
+                        limit_each_label = int(len(sim_score) // 2 * args.demo_filter_rate)
+                        count_each_label = {'0': 0, '1': 0}
+                        context_indices = []
+
+                        if args.debug_mode:
+                            print("Query %s: %s" % (self.query_examples[query_idx].label, self.query_examples[query_idx].text_a)) # debug
+                        for support_idx, score in sim_score:
+                            if count_each_label['0' if float(self.support_examples[support_idx].label) <= median_mapping[args.task_name] else '1'] < limit_each_label:
+                                count_each_label['0' if float(self.support_examples[support_idx].label) <= median_mapping[args.task_name] else '1'] += 1
+                                context_indices.append(support_idx)
+                                if args.debug_mode:
+                                    print("    %.4f %s | %s" % (score, self.support_examples[support_idx].label, self.support_examples[support_idx].text_a)) # debug
+                    else:
+                        limit_each_label = int(len(sim_score) // self.num_labels * args.demo_filter_rate)
+                        count_each_label = {label: 0 for label in self.label_list}
+                        context_indices = []
+
+                        if args.debug_mode:
+                            print("Query %s: %s" % (self.query_examples[query_idx].label, self.query_examples[query_idx].text_a)) # debug
+                        for support_idx, score in sim_score:
+                            if count_each_label[self.support_examples[support_idx].label] < limit_each_label:
+                                count_each_label[self.support_examples[support_idx].label] += 1
+                                context_indices.append(support_idx)
+                                if args.debug_mode:
+                                    print("    %.4f %s | %s" % (score, self.support_examples[support_idx].label, self.support_examples[support_idx].text_a)) # debug
+                else:
+                    # Using demonstrations without filtering
+                    context_indices = [support_idx for support_idx in support_indices
+                               if support_idx != query_idx or mode != "train"]
+
+                # We'll subsample context_indices further later.
+                self.example_idx.append((query_idx, context_indices, sample_idx))
+
+        # If it is not training, we pre-process the data; otherwise, we process the data online.
+        if mode != "train":
+            self.features = []
+            _ = 0
+            for query_idx, context_indices, bootstrap_idx in self.example_idx:
+                # The input (query) example
+                example = self.query_examples[query_idx]
+                # The demonstrations
+                supports = self.select_context([self.support_examples[i] for i in context_indices])
+
+                if args.template_list is not None:
+                    template = args.template_list[sample_idx % len(args.template_list)] # Use template in order
+                else:
+                    template = args.template
+                
+                # print("#" * 50)
+
+                # print(dict(example=example,
+                #     supports=supports,
+                #     use_demo=False,
+                #     label_list=self.label_list,
+                #     prompt=args.prompt,
+                #     template=template,
+                #     label_word_list=self.label_word_list))
+                
+                self.features.append(self.convert_fn(
+                    example=example,
+                    supports=supports,
+                    use_demo=False,
+                    label_list=self.label_list,
+                    prompt=args.prompt,
+                    template=template,
+                    label_word_list=self.label_word_list,
+                    verbose=True if _ == 0 else False,
+                ))
+                # print("#" * 50)
+                
+
+                _ += 1
+        else:
+            self.features = None
+    
+    def convert_fn(
+        self,
+        example,
+        supports,
+        use_demo=False,
+        label_list=None,
+        prompt=False,
+        template=None,
+        label_word_list=None,
+        verbose=False
+    ):
+        """
+        Returns a list of processed "InputFeatures".
+        """
+        max_length = self.args.max_seq_length    
+
+        # Prepare labels
+        label_map = {label: i for i, label in enumerate(label_list)} # Mapping the label names to label ids
+        if len(label_list) == 1:
+            # Regression
+            label_map = {'0': 0, '1': 1}
+
+        # Get example's label id (for training/inference)
+        if example.label is None:
+            example_label = None
+        elif len(label_list) == 1:
+            # Regerssion
+            example_label = float(example.label)
+        else:
+            example_label = label_map[example.label]
+
+        # Prepare other features
+        if not use_demo:
+            # No using demonstrations
+            inputs = tokenize_multipart_input(
+                input_text_list=input_example_to_tuple(example),
+                max_length=max_length,
+                tokenizer=self.tokenizer,
+                task_name=self.args.task_name,
+                prompt=prompt,
+                template=template,
+                label_word_list=label_word_list,
+                first_sent_limit=self.args.first_sent_limit,
+                other_sent_limit=self.args.other_sent_limit,
+            )
+            features = OurInputFeatures(**inputs, label=example_label)
+
+        return features
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, i):
+        if self.features is None:
+            query_idx, context_indices, bootstrap_idx = self.example_idx[i]
+            # The input (query) example
+            example = self.query_examples[query_idx]
+            # The demonstrations
+            supports = self.select_context([self.support_examples[i] for i in context_indices])
+
+            if self.args.template_list is not None:
+                template = self.args.template_list[sample_idx % len(self.args.template_list)]
+            else:
+                template = self.args.template
+
+            features = self.convert_fn(
+                example=example,
+                supports=supports,
+                use_demo=self.use_demo,
+                label_list=self.label_list,
+                prompt=self.args.prompt,
+                template=template,
+                label_word_list=self.label_word_list,
+                verbose=False,
+            )
+        else:
+            features = self.features[i]
+            
+        return features
+    

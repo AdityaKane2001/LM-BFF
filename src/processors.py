@@ -530,7 +530,7 @@ class TextClassificationProcessor(DataProcessor):
                 raise Exception("Task_name not supported.")
 
         return examples
-        
+
 def text_classification_metrics(task_name, preds, labels):
     return {"acc": (preds == labels).mean()}
 
@@ -593,6 +593,26 @@ output_modes_mapping = {
     "trec": "classification",
     "cr": "classification",
     "mpqa": "classification"
+}
+
+classification_processors = {
+    "cola": ColaProcessor(),
+    "mnli": MnliProcessor(),
+    "mnli-mm": MnliMismatchedProcessor(),
+    "mrpc": MrpcProcessor(),
+    "sst-2": Sst2Processor(),
+    "sts-b": StsbProcessor(),
+    "qqp": QqpProcessor(),
+    "qnli": QnliProcessor(),
+    "rte": RteProcessor(),
+    "wnli": WnliProcessor(),
+    "snli": SnliProcessor(),
+    "mr": TextClassificationProcessor("mr"),
+    "sst-5": TextClassificationProcessor("sst-5"),
+    "subj": TextClassificationProcessor("subj"),
+    "trec": TextClassificationProcessor("trec"),
+    "cr": TextClassificationProcessor("cr"),
+    "mpqa": TextClassificationProcessor("mpqa")
 }
 
 # Return a function that takes (task_name, preds, labels) as inputs
